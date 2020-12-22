@@ -1,0 +1,397 @@
+/* 
+  Author: Brian Macomber
+*/
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_attr.h"
+#include "driver/mcpwm.h"
+#include "soc/mcpwm_periph.h"
+#include "esp_system.h"
+#include "esp_log.h"
+#include "driver/uart.h"
+#include "string.h"
+#include "driver/gpio.h"
+#include <stdio.h>
+#include <math.h>
+#include "driver/i2c.h"
+#include "./ADXL343.h"
+
+//Alphanumeric Display Defines
+#define SLAVE_ADDR_ALPHA 0x70        // alphanumeric address
+#define OSC 0x21                     // oscillator cmd
+#define HT16K33_BLINK_DISPLAYON 0x01 // Display on cmd
+#define HT16K33_BLINK_OFF 0          // Blink off cmd
+#define HT16K33_BLINK_CMD 0x80       // Blink cmd
+#define HT16K33_CMD_BRIGHTNESS 0xE0  // Brightness cmd
+
+// Master I2C (LiderLite)
+#define I2C_EXAMPLE_MASTER_SCL_IO 22        // gpio number for i2c clk
+#define I2C_EXAMPLE_MASTER_SDA_IO 23        // gpio number for i2c data
+#define I2C_EXAMPLE_MASTER_NUM I2C_NUM_0    // i2c port
+#define I2C_EXAMPLE_MASTER_TX_BUF_DISABLE 0 // i2c master no buffer needed
+#define I2C_EXAMPLE_MASTER_RX_BUF_DISABLE 0 // i2c master no buffer needed
+#define I2C_EXAMPLE_MASTER_FREQ_HZ 100000   // i2c master clock freq
+#define WRITE_BIT I2C_MASTER_WRITE          // i2c master write
+#define READ_BIT I2C_MASTER_READ            // i2c master read
+#define ACK_CHECK_EN true                   // i2c master will check ack
+#define ACK_CHECK_DIS false                 // i2c master will not check ack
+#define ACK_VAL 0x00                        // i2c ack value
+#define NACK_VAL 0xFF                       // i2c nack value
+
+#define I2C_EXAMPLE_MASTER_SCL_IO_DISPLAY 15
+#define I2C_EXAMPLE_MASTER_SDA_IO_DISPLAY 14
+#define I2C_EXAMPLE_MASTER_NUM_DISPLAY I2C_NUM_1 // i2c port for alphanumeric
+
+// ADXL343
+#define SLAVE_ADDR 0x62 // 0x53
+
+#define distance_high_reg 0x0F
+#define distance_low_reg 0x10
+#define velocity_reg 0x09
+
+//UART Defines
+#define ECHO_TEST_TXD 17
+#define ECHO_TEST_RXD 16
+#define ECHO_TEST_RTS (UART_PIN_NO_CHANGE)
+#define ECHO_TEST_CTS (UART_PIN_NO_CHANGE)
+
+//UART Defines
+#define ECHO_TEST_TXD_2 25
+#define ECHO_TEST_RXD_2 26
+#define ECHO_TEST_RTS_2 (UART_PIN_NO_CHANGE)
+#define ECHO_TEST_CTS_2 (UART_PIN_NO_CHANGE)
+
+#define BUF_SIZE (128)
+
+//Timer defines
+#define TIMER_DIVIDER 16                             //  Hardware timer clock divider
+#define TIMER_SCALE (TIMER_BASE_CLK / TIMER_DIVIDER) // convert counter value to seconds
+#define TIMER_INTERVAL0_SEC (0.4)                    // sample test interval for the first timer
+#define TIMER_INTERVAL1_SEC (5.78)                   // sample test interval for the second timer
+#define TEST_WITHOUT_RELOAD 0                        // testing will be done without auto reload
+#define TEST_WITH_RELOAD 1                           // testing will be done with auto reload
+
+//RANGE OF THE LIDARLITE
+int16_t lidarLiteRange = 0;
+
+int alpha_oscillator()
+{
+    int ret;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (SLAVE_ADDR_ALPHA << 1) | WRITE_BIT, ACK_CHECK_EN);
+    i2c_master_write_byte(cmd, OSC, ACK_CHECK_EN);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_EXAMPLE_MASTER_NUM_DISPLAY, cmd, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd);
+    vTaskDelay(200 / portTICK_RATE_MS);
+    return ret;
+}
+
+// Set blink rate to off
+int no_blink()
+{
+    int ret;
+    i2c_cmd_handle_t cmd2 = i2c_cmd_link_create();
+    i2c_master_start(cmd2);
+    i2c_master_write_byte(cmd2, (SLAVE_ADDR_ALPHA << 1) | WRITE_BIT, ACK_CHECK_EN);
+    i2c_master_write_byte(cmd2, HT16K33_BLINK_CMD | HT16K33_BLINK_DISPLAYON | (HT16K33_BLINK_OFF << 1), ACK_CHECK_EN);
+    i2c_master_stop(cmd2);
+    ret = i2c_master_cmd_begin(I2C_EXAMPLE_MASTER_NUM_DISPLAY, cmd2, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd2);
+    vTaskDelay(200 / portTICK_RATE_MS);
+    return ret;
+}
+
+// Set Brightness
+int set_brightness_max(uint8_t val)
+{
+    int ret;
+    i2c_cmd_handle_t cmd3 = i2c_cmd_link_create();
+    i2c_master_start(cmd3);
+    i2c_master_write_byte(cmd3, (SLAVE_ADDR_ALPHA << 1) | WRITE_BIT, ACK_CHECK_EN);
+    i2c_master_write_byte(cmd3, HT16K33_CMD_BRIGHTNESS | val, ACK_CHECK_EN);
+    i2c_master_stop(cmd3);
+    ret = i2c_master_cmd_begin(I2C_EXAMPLE_MASTER_NUM_DISPLAY, cmd3, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd3);
+    vTaskDelay(200 / portTICK_RATE_MS);
+    return ret;
+}
+
+static void i2c_master_init()
+{
+    // Debug
+    printf("\n>> i2c Config\n");
+    int err;
+
+    // Port configuration
+    int i2c_master_port = I2C_EXAMPLE_MASTER_NUM;
+    // Port configuration (alphanumeric)
+    int i2c_master_port_display = I2C_EXAMPLE_MASTER_NUM_DISPLAY;
+
+    /// Define I2C configurations for LidarLite
+    i2c_config_t conf;
+    conf.mode = I2C_MODE_MASTER;                        // Master mode
+    conf.sda_io_num = I2C_EXAMPLE_MASTER_SDA_IO;        // Default SDA pin
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;            // Internal pullup
+    conf.scl_io_num = I2C_EXAMPLE_MASTER_SCL_IO;        // Default SCL pin
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;            // Internal pullup
+    conf.master.clk_speed = I2C_EXAMPLE_MASTER_FREQ_HZ; // CLK frequency
+    err = i2c_param_config(i2c_master_port, &conf);     // Configure
+    if (err == ESP_OK)
+    {
+        printf("- parameters: ok\n");
+    }
+
+    // Install I2C driver
+    err = i2c_driver_install(i2c_master_port, conf.mode,
+                             I2C_EXAMPLE_MASTER_RX_BUF_DISABLE,
+                             I2C_EXAMPLE_MASTER_TX_BUF_DISABLE, 0);
+    if (err == ESP_OK)
+    {
+        printf("- initialized: yes\n");
+    }
+
+    /// Define I2C configurations for alphanumeric
+    conf.mode = I2C_MODE_MASTER;                            // Master mode
+    conf.sda_io_num = I2C_EXAMPLE_MASTER_SDA_IO_DISPLAY;    // Default SDA pin
+    conf.sda_pullup_en = GPIO_PULLUP_ENABLE;                // Internal pullup
+    conf.scl_io_num = I2C_EXAMPLE_MASTER_SCL_IO_DISPLAY;    // Default SCL pin
+    conf.scl_pullup_en = GPIO_PULLUP_ENABLE;                // Internal pullup
+    conf.master.clk_speed = I2C_EXAMPLE_MASTER_FREQ_HZ;     // CLK frequency
+    err = i2c_param_config(i2c_master_port_display, &conf); // Configure
+    if (err == ESP_OK)
+    {
+        printf("- parameters: ok\n");
+    }
+
+    // Install I2C driver
+    err = i2c_driver_install(i2c_master_port_display, conf.mode,
+                             I2C_EXAMPLE_MASTER_RX_BUF_DISABLE,
+                             I2C_EXAMPLE_MASTER_TX_BUF_DISABLE, 0);
+    if (err == ESP_OK)
+    {
+        printf("- initialized: yes\n");
+    }
+
+    // Data in MSB mode
+    i2c_set_data_mode(i2c_master_port, I2C_DATA_MODE_MSB_FIRST, I2C_DATA_MODE_MSB_FIRST);
+
+    // Data in MSB mode
+    i2c_set_data_mode(i2c_master_port_display, I2C_DATA_MODE_MSB_FIRST, I2C_DATA_MODE_MSB_FIRST);
+}
+
+// Utility  Functions //////////////////////////////////////////////////////////
+
+// Utility function to test for I2C device address -- not used in deploy
+int testConnection(uint8_t devAddr, int32_t timeout)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (devAddr << 1) | I2C_MASTER_WRITE, ACK_CHECK_EN);
+    i2c_master_stop(cmd);
+    int err = i2c_master_cmd_begin(I2C_EXAMPLE_MASTER_NUM, cmd, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd);
+    return err;
+}
+
+// Utility function to scan for i2c device
+static void i2c_scanner()
+{
+    int32_t scanTimeout = 1000;
+    printf("\n>> I2C scanning ..."
+           "\n");
+    uint8_t count = 0;
+    for (uint8_t i = 1; i < 127; i++)
+    {
+        // printf("0x%X%s",i,"\n");
+        if (testConnection(i, scanTimeout) == ESP_OK)
+        {
+            printf("- Device found at address: 0x%X%s", i, "\n");
+            count++;
+        }
+    }
+    if (count == 0)
+    {
+        printf("- No I2C devices found!"
+               "\n");
+    }
+}
+
+// Get Device ID
+int getDeviceID(uint8_t *data)
+{
+    int ret;
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (SLAVE_ADDR << 1) | WRITE_BIT, ACK_CHECK_EN);
+    i2c_master_write_byte(cmd, ADXL343_REG_DEVID, ACK_CHECK_EN);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (SLAVE_ADDR << 1) | READ_BIT, ACK_CHECK_EN);
+    i2c_master_read_byte(cmd, data, ACK_CHECK_DIS);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(I2C_EXAMPLE_MASTER_NUM, cmd, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+// Write one byte to register
+// Write one byte to register
+int writeRegister(uint8_t reg, uint8_t data)
+{
+
+    //printf("--Writing %d to reg %d!--\n", data, reg);
+
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (SLAVE_ADDR << 1) | WRITE_BIT, ACK_CHECK_EN);
+    i2c_master_write_byte(cmd, reg, ACK_CHECK_EN);
+    i2c_master_write_byte(cmd, data, ACK_CHECK_EN);
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(I2C_EXAMPLE_MASTER_NUM, cmd, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd);
+    return 0;
+}
+
+// Read register
+uint8_t readRegister(uint8_t reg, uint8_t *regData)
+{
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (SLAVE_ADDR << 1) | WRITE_BIT, ACK_CHECK_EN);
+    i2c_master_write_byte(cmd, reg, ACK_CHECK_EN);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (SLAVE_ADDR << 1) | READ_BIT, ACK_CHECK_EN);
+    i2c_master_read_byte(cmd, regData, ACK_CHECK_DIS);
+
+    //printf("--Read in value: *regData = %d\n", *regData);
+
+    i2c_master_stop(cmd);
+    i2c_master_cmd_begin(I2C_EXAMPLE_MASTER_NUM, cmd, 1000 / portTICK_RATE_MS);
+    i2c_cmd_link_delete(cmd);
+
+    //printf("---Read in value: *regData = %d\n", *regData);
+    return 0;
+}
+
+// read 16 bits (2 bytes)
+// Function used to read the LidarLite according to the garmin data sheet
+uint16_t read16Dis()
+{
+    uint8_t data = 0;
+    uint8_t data2 = 0;
+    uint16_t overall = 0;
+
+    // uint8_t reg1 = 0x01;
+    uint8_t reg2 = 0x00;
+    uint8_t reg3 = 0x04;
+    uint8_t reg4 = 0x10;
+    uint8_t reg5 = 0x01;
+    uint8_t reg6 = 0x11;
+
+    writeRegister(reg2, reg3);
+    readRegister(reg5, &data);
+    //printf("%d\n", data);
+
+    while (readRegister(reg5, &data) % 2 == 1)
+    {
+        //   readRegister(reg5, &data);
+    }
+
+    readRegister(reg4, &data);
+    readRegister(reg6, &data2);
+
+    overall = (data2 << 8) + data;
+    return overall;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+void getDistance(float *dis)
+{
+    lidarLiteRange = read16Dis();
+    printf("LIDARLite: %.2d  centimeters\n", lidarLiteRange);
+    *dis = lidarLiteRange;
+}
+
+static void test_lidarLite()
+{
+    printf("\n>> Polling Lidar\n");
+    int setpoint = 50;
+    int previous_error = 0;
+    int integral = 0;
+    int derivative = 0;
+    int error = 0;
+    int dist;
+    while (1)
+    {
+        float output;
+        vTaskDelay(400 / portTICK_RATE_MS);
+        getDistance(&output); //get distance
+        error = setpoint - output;
+        integral = integral + error * .001;
+        derivative = (error - previous_error) / .001;
+        previous_error = error;
+        if (error < 0) //red
+        {
+            gpio_set_level(12, 0);
+            gpio_set_level(27, 0);
+            gpio_set_level(33, 1);
+        }
+        else if (error > 0.5) // blue
+        {
+            gpio_set_level(12, 1);
+            gpio_set_level(27, 0);
+            gpio_set_level(33, 0);
+        }
+        else //green
+        {
+            gpio_set_level(12, 0);
+            gpio_set_level(27, 1);
+            gpio_set_level(33, 0);
+        }
+        vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+}
+
+void init(void)
+{
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE};
+    uart_param_config(UART_NUM_1, &uart_config);
+    uart_set_pin(UART_NUM_1, TXD_PIN, RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    // We won't use a buffer for sending data.
+    uart_driver_install(UART_NUM_1, RX_BUF_SIZE * 2, 0, 0, NULL, 0);
+
+    //GPIO
+    gpio_pad_select_gpio(12); // blue
+    gpio_pad_select_gpio(27); // green
+    gpio_pad_select_gpio(33); // red
+
+    /* Set the GPIO as a push/pull output */
+    gpio_set_direction(12, GPIO_MODE_OUTPUT); //blue
+    gpio_set_direction(27, GPIO_MODE_OUTPUT); //green
+    gpio_set_direction(33, GPIO_MODE_OUTPUT); // red
+}
+
+int sendData(const char *logName, const char *data)
+{
+    const int len = strlen(data);
+    const int txBytes = uart_write_bytes(UART_NUM_1, data, len);
+    ESP_LOGI(logName, "Wrote %d bytes", txBytes);
+    return txBytes;
+}
+
+void app_main(void)
+{
+    init();
+    i2c_master_init();
+    i2c_scanner();
+
+    xTaskCreate(test_lidarLite, "test_lidarLite", 4096, NULL, 5, NULL);
+}
